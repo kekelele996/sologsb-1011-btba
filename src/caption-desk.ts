@@ -1,15 +1,29 @@
 import { LitElement, css, html, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
+import { batchStyles } from './batch-ui.css';
 import {
   applyRules,
+  BATCH_CATEGORY_META,
   cloneModel,
+  composeBatchPreview,
+  createBatchDraft,
   createInitialModel,
   mergeConfirmedSegments,
   normalizeNumbers,
   queueStats,
+  refreshBatchDraft,
+  scanBatchIssues,
   STORAGE_KEY,
   simulateLatency,
+  submitBatch,
   toSrt,
+  undoBatch,
+  type BatchDraft,
+  type BatchIssue,
+  type BatchIssueCategory,
+  type BatchItemStatus,
+  type BatchPreviewRow,
+  type BatchReport,
   type CaptionSegment,
   type ConnectionState,
   type DeskModel,
@@ -45,9 +59,23 @@ function connectionLabel(state: ConnectionState): string {
   return { connected: '连接稳定', degraded: '延迟波动', offline: '离线校正' }[state];
 }
 
+const BATCH_CATEGORY_ORDER: BatchIssueCategory[] = ['punctuation', 'number', 'term', 'stale', 'duplicate'];
+
+const BATCH_STATUS_META: Record<BatchItemStatus, { label: string; tagType: string }> = {
+  applied: { label: '已自动改写', tagType: 'green' },
+  checked: { label: '人工已核对', tagType: 'blue' },
+  skipped: { label: '已跳过', tagType: 'gray' },
+  conflict: { label: '冲突保留原文', tagType: 'red' },
+};
+
+/** 可勾选 = 可安全改写，或超时/重复（勾选表示人工已核对）；术语冲突不可勾选。 */
+function isIssueCheckable(issue: BatchIssue): boolean {
+  return !issue.blocked || issue.category === 'stale' || issue.category === 'duplicate';
+}
+
 @customElement('caption-desk')
 export class CaptionDesk extends LitElement {
-  static styles = css`
+  static styles = [css`
     :host {
       display: block;
       min-height: 100vh;
@@ -236,7 +264,7 @@ export class CaptionDesk extends LitElement {
       .status-strip { grid-template-columns: repeat(4, 1fr); }
       .status-cell.hero { grid-column: 1 / -1; }
     }
-  `;
+  `, batchStyles];
 
   @state() private model: DeskModel = this.loadModel();
   @state() private dark = localStorage.getItem(`${STORAGE_KEY}-theme`) === 'dark';
@@ -246,12 +274,17 @@ export class CaptionDesk extends LitElement {
   @state() private ruleSpeaker = '';
   @state() private filter: 'active' | 'all' | 'attention' = 'active';
   @state() private showRuleForm = false;
+  @state() private batchOpen = false;
+  @state() private batchView: 'issues' | 'preview' | 'result' | 'history' = 'issues';
+  @state() private batchDraft: BatchDraft | null = null;
+  @state() private lastReport: BatchReport | null = null;
   private past: DeskModel[] = [];
   private future: DeskModel[] = [];
   private ticker?: number;
 
   connectedCallback(): void {
     super.connectedCallback();
+    this.syncBatchDraft();
     window.addEventListener('keydown', this.handleShortcut);
     this.ticker = window.setInterval(() => {
       const next = simulateLatency(this.model);
@@ -285,6 +318,16 @@ export class CaptionDesk extends LitElement {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...this.model, updatedAt: Date.now() }));
   }
 
+  /** 草稿挂在模型上随本地存储保留；组件内镜像一份用于模态框渲染。 */
+  private syncBatchDraft(): void {
+    this.batchDraft = this.model.batchDraft ? structuredClone(this.model.batchDraft) : null;
+  }
+
+  private saveBatchDraft(): void {
+    this.model = { ...this.model, batchDraft: this.batchDraft ? structuredClone(this.batchDraft) : null };
+    this.persist();
+  }
+
   private commit(label: string, update: (current: DeskModel) => DeskModel): void {
     const previous = cloneModel(this.model);
     const next = update(cloneModel(this.model));
@@ -307,6 +350,7 @@ export class CaptionDesk extends LitElement {
     this.future = [cloneModel(this.model), ...this.future].slice(0, HISTORY_LIMIT);
     this.model = previous;
     this.persist();
+    this.syncBatchDraft();
   }
 
   private redo(): void {
@@ -315,6 +359,7 @@ export class CaptionDesk extends LitElement {
     this.past = [...this.past, cloneModel(this.model)].slice(-HISTORY_LIMIT);
     this.model = next;
     this.persist();
+    this.syncBatchDraft();
   }
 
   private pushToast(kind: ToastMessage['kind'], title: string, subtitle: string): void {
@@ -560,6 +605,172 @@ export class CaptionDesk extends LitElement {
     localStorage.setItem(`${STORAGE_KEY}-theme`, this.dark ? 'dark' : 'light');
   }
 
+  // ── 质检批次 ───────────────────────────────────────────────
+
+  private get batchIssues(): BatchIssue[] {
+    return this.batchDraft?.issues ?? [];
+  }
+
+  private get currentBatchIssueCount(): number {
+    return scanBatchIssues(this.model).length;
+  }
+
+  private get batchReports(): BatchReport[] {
+    return this.model.batchReports ?? [];
+  }
+
+  /** 当前各待处理片段命中的问题组，用于在待确认卡片上显示批次风险标记。 */
+  private get segmentIssueMap(): Map<string, BatchIssueCategory[]> {
+    const map = new Map<string, BatchIssueCategory[]>();
+    for (const issue of scanBatchIssues(this.model)) {
+      const list = map.get(issue.segmentId) ?? [];
+      if (!list.includes(issue.category)) list.push(issue.category);
+      map.set(issue.segmentId, list);
+    }
+    return map;
+  }
+
+  private openBatch(): void {
+    if (this.batchDraft) {
+      // 重开未完成批次：以当前队列重新扫描，但保留已勾选状态
+      this.batchDraft = refreshBatchDraft(structuredClone(this.batchDraft), this.model);
+      this.saveBatchDraft();
+    } else {
+      this.batchDraft = createBatchDraft(this.model);
+      this.saveBatchDraft();
+    }
+    this.batchView = 'issues';
+    this.batchOpen = true;
+  }
+
+  private closeBatch(): void {
+    this.batchOpen = false;
+  }
+
+  private rescanBatch(): void {
+    if (!this.batchDraft) return;
+    this.batchDraft = refreshBatchDraft(structuredClone(this.batchDraft), this.model);
+    this.saveBatchDraft();
+    this.pushToast('info', '批次已重新扫描', '新片段和最新校对结果已纳入，勾选状态已保留');
+  }
+
+  private discardBatch(): void {
+    if (!this.batchDraft) return;
+    this.batchDraft = null;
+    this.saveBatchDraft();
+    this.batchOpen = false;
+    this.pushToast('info', '已放弃当前批次草稿', '批次问题未做任何改动');
+  }
+
+  private toggleIssue(issueId: string): void {
+    if (!this.batchDraft) return;
+    const issues = this.batchDraft.issues.map((issue) => (
+      issue.id === issueId ? { ...issue, selected: !issue.selected } : issue
+    ));
+    this.batchDraft = { ...this.batchDraft, issues };
+    this.saveBatchDraft();
+  }
+
+  private toggleGroup(category: BatchIssueCategory, value: boolean): void {
+    if (!this.batchDraft) return;
+    const issues = this.batchDraft.issues.map((issue) => (
+      issue.category === category && isIssueCheckable(issue)
+        ? { ...issue, selected: value }
+        : issue
+    ));
+    this.batchDraft = { ...this.batchDraft, issues };
+    this.saveBatchDraft();
+  }
+
+  private selectAllSafe(): void {
+    if (!this.batchDraft) return;
+    const issues = this.batchDraft.issues.map((issue) => ({ ...issue, selected: !issue.blocked }));
+    this.batchDraft = { ...this.batchDraft, issues };
+    this.saveBatchDraft();
+  }
+
+  private clearSelection(): void {
+    if (!this.batchDraft) return;
+    const issues = this.batchDraft.issues.map((issue) => ({ ...issue, selected: false }));
+    this.batchDraft = { ...this.batchDraft, issues };
+    this.saveBatchDraft();
+  }
+
+  private get batchPreviewRows(): BatchPreviewRow[] {
+    if (!this.batchDraft) return [];
+    return composeBatchPreview(this.batchDraft.issues, this.model.segments, this.model.rules);
+  }
+
+  private get batchPreviewStats() {
+    const rows = this.batchPreviewRows;
+    const issues = this.batchIssues;
+    return {
+      rewrite: rows.filter((row) => row.changed).length,
+      checked: rows.filter((row) => row.checked).length,
+      conflicts: rows.filter((row) => row.conflict).length,
+      skipped: issues.filter((issue) => !issue.selected && !(issue.category === 'term' && issue.conflict)).length,
+    };
+  }
+
+  private goPreview(): void {
+    if (!this.batchDraft) return;
+    if (!this.batchDraft.issues.some((issue) => issue.selected)) {
+      this.pushToast('warning', '还没有勾选任何问题', '标点、数字、术语可整组勾选；超时和重复默认可勾选为“人工已核对”');
+      return;
+    }
+    this.batchView = 'preview';
+  }
+
+  private backToIssues(): void {
+    this.batchView = 'issues';
+  }
+
+  /** 预览确认后一次提交；不走普通逐段历史，使用批次自带的开始前快照整批撤销。 */
+  private submitBatchNow(): void {
+    if (!this.batchDraft) return;
+    const { model, report } = submitBatch(this.model, structuredClone(this.batchDraft));
+    this.past = [...this.past, cloneModel(this.model)].slice(-HISTORY_LIMIT);
+    this.future = [];
+    this.model = model;
+    this.persist();
+    this.batchDraft = null;
+    this.lastReport = report;
+    this.batchView = 'result';
+    this.pushToast('success', '质检批次已提交', `自动改写 ${report.appliedCount} 项 · 已核对 ${report.checkedCount} 项 · 冲突 ${report.conflictCount} 项`);
+  }
+
+  private restoreBatch(model: DeskModel): void {
+    this.model = model;
+    this.persist();
+    this.syncBatchDraft();
+  }
+
+  private undoLastBatch(): void {
+    if (!this.lastReport) return;
+    this.undoBatchReport(this.lastReport.id);
+  }
+
+  private undoBatchReport(reportId: string): void {
+    const restored = undoBatch(this.model, reportId);
+    if (!restored) {
+      this.pushToast('warning', '该批次的撤销快照已不可用', '只保留最近一次批次的开始前快照；较早日历只能用 ⌘/Ctrl+Z 逐步撤销');
+      return;
+    }
+    this.restoreBatch(restored);
+    this.batchView = 'issues';
+    this.batchOpen = true;
+    this.pushToast('success', '已整批恢复到开始前', '改动与规则计数已还原，批次重新置为未完成草稿');
+  }
+
+  private openHistory(): void {
+    this.batchView = 'history';
+    this.batchOpen = true;
+  }
+
+  private formatDateTime(timestamp: number): string {
+    return new Date(timestamp).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+  }
+
   private handleShortcut = (event: KeyboardEvent): void => {
     const modifier = event.metaKey || event.ctrlKey;
     if (modifier && event.key.toLocaleLowerCase() === 'z') {
@@ -599,9 +810,12 @@ export class CaptionDesk extends LitElement {
     if (!segments.length) {
       return html`<div class="empty"><strong>待确认区已清空</strong><p>新的实时片段到达时会自动进入这里。</p></div>`;
     }
+    const issueMap = this.segmentIssueMap;
     return html`
       <div class="segment-list">
-        ${segments.map((item) => html`
+        ${segments.map((item) => {
+          const issues = issueMap.get(item.id) ?? [];
+          return html`
           <button class="segment-card ${item.id === this.model.selectedId ? 'selected' : ''} ${item.state}" @click=${() => this.selectSegment(item.id)}>
             <div class="segment-meta">
               <span>${formatClock(item.startTime)} · #${String(item.sequence).padStart(3, '0')}</span>
@@ -609,6 +823,9 @@ export class CaptionDesk extends LitElement {
             </div>
             <p class="segment-text">${item.original}</p>
             ${item.corrected !== item.original ? html`<p class="segment-corrected">${item.corrected}</p>` : nothing}
+            ${issues.length ? html`<div class="segment-batch-tags">
+              ${issues.map((category) => html`<span class="batch-pill ${category}">${BATCH_CATEGORY_META[category].label}</span>`)}
+            </div>` : nothing}
             <div class="segment-foot">
               <span>${item.speaker}</span>
               <span>·</span>
@@ -618,7 +835,7 @@ export class CaptionDesk extends LitElement {
             ${item.state === 'stale' && item.staleReason ? html`<div class="issue-note">${item.staleReason}。确认前请核对直播上下文。</div>` : nothing}
             ${item.state === 'duplicate' ? html`<div class="issue-note duplicate-note">${item.staleReason || '检测到重复片段'}，请保留或忽略。</div>` : nothing}
           </button>
-        `)}
+        `;})}
       </div>
     `;
   }
@@ -690,6 +907,261 @@ export class CaptionDesk extends LitElement {
           </div>
         </div>
       </div>
+    `;
+  }
+
+  private renderBatchIssues() {
+    const draft = this.batchDraft;
+    if (!draft) return nothing;
+    if (!draft.issues.length) {
+      return html`<div class="empty"><strong>没有需要质检的风险项</strong><p>待确认区当前没有标点、数字、术语、超时或重复问题。</p></div>`;
+    }
+    const groups = BATCH_CATEGORY_ORDER
+      .map((category) => ({ category, issues: draft.issues.filter((issue) => issue.category === category) }))
+      .filter((group) => group.issues.length);
+
+    return html`
+      <div class="batch-summary">
+        <strong>本批共 ${draft.issues.length} 个风险项 · 涉及 ${new Set(draft.issues.map((issue) => issue.segmentId)).size} 段</strong>
+        <span>批次开始于 ${this.formatDateTime(draft.startedAt)}，勾选状态随本地草稿保存</span>
+      </div>
+      <div class="batch-toolbar">
+        <cds-button kind="tertiary" size="sm" @click=${this.selectAllSafe}>勾选可安全改写项</cds-button>
+        <cds-button kind="ghost" size="sm" @click=${this.clearSelection}>全部取消</cds-button>
+        <cds-button kind="ghost" size="sm" @click=${this.rescanBatch}>重新扫描</cds-button>
+        <span class="spacer"></span>
+        <small>超时与重复默认跳过，勾选表示“人工已核对”；术语冲突保留原文不可自动改写</small>
+      </div>
+      ${groups.map(({ category, issues }) => {
+        const checkable = issues.filter((issue) => isIssueCheckable(issue));
+        const checkedCount = issues.filter((issue) => issue.selected).length;
+        const allChecked = checkable.length > 0 && checkable.every((issue) => issue.selected);
+        const meta = BATCH_CATEGORY_META[category];
+        return html`
+          <section class="batch-group">
+            <header class="batch-group-head">
+              <div>
+                <strong>${meta.label} · ${issues.length} 项</strong>
+                <p>${meta.hint}</p>
+              </div>
+              <div class="batch-group-count">
+                ${checkable.length
+                  ? html`<label class="batch-check"><input
+                      type="checkbox"
+                      .checked=${allChecked}
+                      .indeterminate=${checkedCount > 0 && !allChecked}
+                      @change=${(event: Event) => this.toggleGroup(category, (event.currentTarget as HTMLInputElement).checked)}
+                    /> 整组勾选（${checkedCount}/${checkable.length}）</label>`
+                  : html`整组 ${checkedCount}/${issues.length} 已核对`}
+              </div>
+            </header>
+            ${issues.map((issue) => this.renderBatchIssue(issue))}
+          </section>
+        `;
+      })}
+    `;
+  }
+
+  private renderBatchIssue(issue: BatchIssue) {
+    const checkable = isIssueCheckable(issue);
+    return html`
+      <div class="batch-item ${issue.blocked ? 'blocked' : ''} ${issue.conflict ? 'has-conflict' : ''}">
+        <label class="batch-check">
+          <input
+            type="checkbox"
+            ?disabled=${!checkable}
+            .checked=${issue.selected}
+            @change=${() => this.toggleIssue(issue.id)}
+          />
+        </label>
+        <div>
+          <div class="batch-item-meta">
+            <button type="button" @click=${() => this.selectSegment(issue.segmentId)}>#${String(issue.sequence).padStart(3, '0')}</button>
+            <span>${formatClock(issue.startTime)}</span>
+            <span>${issue.speaker}</span>
+            <span>${BATCH_CATEGORY_META[issue.category].label}</span>
+            ${issue.ruleIds.length ? html`<span>规则 ${issue.ruleIds.length} 条</span>` : nothing}
+          </div>
+          <p class="batch-item-text">${issue.before}</p>
+          ${issue.after ? html`<p class="batch-item-after">${issue.after}</p>` : nothing}
+          <p class="batch-item-text" style="font-size:11px;color:var(--cds-text-secondary,#525252);margin-top:3px;">${issue.summary}</p>
+          ${issue.conflict && issue.category === 'term' ? html`<div class="batch-conflict">${issue.conflict}</div>` : nothing}
+          ${issue.conflict && issue.category !== 'term' ? html`<div class="batch-skip-note">${issue.conflict}</div>` : nothing}
+          ${(issue.category === 'stale' || issue.category === 'duplicate') && !issue.selected
+            ? html`<div class="batch-skip-note">默认跳过；勾选仅标记“人工已核对”，内容改写仍以同段标点 / 数字 / 术语勾选项为准。</div>` : nothing}
+        </div>
+      </div>
+    `;
+  }
+
+  private renderBatchPreview() {
+    const rows = this.batchPreviewRows;
+    const stats = this.batchPreviewStats;
+    const conflicts = rows.filter((row) => row.conflict);
+    const ruleChips = this.batchDraft
+      ? this.model.rules.filter((rule) => this.batchDraft!.issues.some((issue) => issue.selected && issue.ruleIds.includes(rule.id)))
+      : [];
+    return html`
+      <div class="batch-preview-stats">
+        <span><b>${stats.rewrite}</b> 段将自动改写</span>
+        <span><b>${stats.checked}</b> 段仅标记人工核对</span>
+        <span><b>${stats.conflicts}</b> 段术语冲突保留原文</span>
+        <span><b>${stats.skipped}</b> 个问题跳过</span>
+      </div>
+      ${ruleChips.length ? html`<p class="batch-note">将套用的术语规则：</p><div class="batch-rule-stats">
+        ${ruleChips.map((rule) => html`<span class="batch-rule-chip">${rule.source} → ${rule.replacement}</span>`)}
+      </div>` : nothing}
+      ${conflicts.length ? html`
+        <div class="batch-conflict" style="margin-bottom:12px;">
+          ${conflicts.length} 段命中多条术语规则，本次提交保留原内容，请提交后到编辑台逐段处理。
+        </div>` : nothing}
+      ${rows.map((row) => html`
+        <article class="batch-preview-row">
+          <header>
+            <span>#${String(row.sequence).padStart(3, '0')}</span>
+            <span>${row.speaker}</span>
+            ${row.changed ? html`<cds-tag type="green" size="sm">自动改写</cds-tag>` : nothing}
+            ${row.checked ? html`<cds-tag type="blue" size="sm">人工已核对</cds-tag>` : nothing}
+            ${row.conflict ? html`<cds-tag type="red" size="sm">冲突保留</cds-tag>` : nothing}
+          </header>
+          <div class="batch-preview-body">
+            <p>原文：${row.before}</p>
+            ${row.changed ? html`<p class="after">改后：${row.after}</p>` : html`<p class="note">${row.conflict ?? '内容保持不变'}</p>`}
+          </div>
+        </article>
+      `)}
+    `;
+  }
+
+  private renderBatchResult() {
+    const report = this.lastReport;
+    if (!report) return nothing;
+    const conflictItems = report.items.filter((item) => item.status === 'conflict');
+    return html`
+      <div class="batch-done-head">
+        <div><strong>${report.appliedCount}</strong><span>自动改写项</span></div>
+        <div><strong>${report.checkedCount}</strong><span>人工已核对</span></div>
+        <div><strong>${report.skippedCount}</strong><span>跳过项</span></div>
+        <div><strong>${report.conflictCount}</strong><span>术语冲突</span></div>
+      </div>
+      ${report.ruleStats.length ? html`
+        <p class="batch-note">规则命中次数：</p>
+        <div class="batch-rule-stats">
+          ${report.ruleStats.map((stat) => html`
+            <span class="batch-rule-chip">${stat.source} → ${stat.replacement} · 命中 ${stat.hits} 处 / ${stat.appliedSegments} 段${stat.conflicts ? ` · ${stat.conflicts} 段冲突未套用` : ''}</span>
+          `)}
+        </div>` : nothing}
+      ${conflictItems.length ? html`
+        <div class="batch-conflict">
+          ${conflictItems.map((item) => html`<div>#${String(item.sequence).padStart(3, '0')}：${item.note}</div>`)}
+        </div>` : nothing}
+      <p class="batch-note">提交于 ${this.formatDateTime(report.submittedAt)}。改动明细与冲突原因可在“批次回看”中随时查看；撤销会整批恢复到开始前。</p>
+    `;
+  }
+
+  private renderBatchHistory() {
+    const reports = this.batchReports;
+    if (!reports.length) {
+      return html`<div class="empty"><strong>还没有已提交的质检批次</strong><p>提交后这里会展示改动、规则命中次数和冲突原因。</p></div>`;
+    }
+    return html`
+      ${reports.map((report) => {
+        const statusMeta = BATCH_STATUS_META;
+        return html`
+          <details class="batch-report">
+            <summary>
+              <strong>批次 ${this.formatDateTime(report.submittedAt)}</strong>
+              <span>改写 ${report.appliedCount} · 核对 ${report.checkedCount} · 跳过 ${report.skippedCount} · 冲突 ${report.conflictCount}</span>
+              <span>
+                ${report.undoneAt
+                  ? html`<cds-tag type="warm-gray" size="sm">已于 ${this.formatDateTime(report.undoneAt)} 撤销</cds-tag>`
+                  : this.model.batchUndo?.reportId === report.id
+                    ? html`
+                        <cds-button
+                          kind="danger--tertiary"
+                          size="sm"
+                          @click=${(event: Event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            this.undoBatchReport(report.id);
+                          }}
+                        >整批撤销</cds-button>
+                      `
+                    : html`<cds-tag type="gray" size="sm">快照已被新批次覆盖</cds-tag>`}
+              </span>
+            </summary>
+            <div class="batch-report-body">
+              <div class="batch-preview-stats">
+                ${(Object.keys(report.counts) as BatchIssueCategory[]).map((category) => html`
+                  <span><b>${report.counts[category]}</b> ${BATCH_CATEGORY_META[category].label}</span>
+                `)}
+              </div>
+              ${report.ruleStats.length ? html`<p class="batch-note">规则命中：</p><div class="batch-rule-stats">
+                ${report.ruleStats.map((stat) => html`
+                  <span class="batch-rule-chip">${stat.source} → ${stat.replacement} · ${stat.hits} 处 / ${stat.appliedSegments} 段${stat.conflicts ? ` · 冲突 ${stat.conflicts}` : ''}</span>
+                `)}
+              </div>` : nothing}
+              ${report.items.map((item) => html`
+                <div class="batch-report-item ${item.status}">
+                  <div class="batch-report-item-head">
+                    <span>#${String(item.sequence).padStart(3, '0')}</span>
+                    <span>${BATCH_CATEGORY_META[item.category].label}</span>
+                    <cds-tag type=${statusMeta[item.status].tagType} size="sm">${statusMeta[item.status].label}</cds-tag>
+                    <span>${item.summary}</span>
+                  </div>
+                  <p class="batch-item-text">${item.before}</p>
+                  ${item.after && item.after !== item.before ? html`<p class="batch-item-after">${item.after}</p>` : nothing}
+                  ${item.note ? html`<p class="batch-note">${item.note}</p>` : nothing}
+                </div>
+              `)}
+            </div>
+          </details>
+        `;
+      })}
+    `;
+  }
+
+  private renderBatchModal() {
+    if (!this.batchOpen) return nothing;
+    const heading = {
+      issues: this.batchDraft ? '质检批次 · 问题分组' : '质检批次',
+      preview: '质检批次 · 提交前预览',
+      result: '批次已提交',
+      history: '批次回看',
+    }[this.batchView];
+
+    return html`
+      <cds-modal size="lg" open @cds-modal-closed=${this.closeBatch}>
+        <cds-modal-header>
+          <cds-modal-heading>${heading}</cds-modal-heading>
+        </cds-modal-header>
+        <cds-modal-body style="max-height:62vh;overflow:auto;">
+          ${this.batchView === 'issues' ? this.renderBatchIssues() : nothing}
+          ${this.batchView === 'preview' ? this.renderBatchPreview() : nothing}
+          ${this.batchView === 'result' ? this.renderBatchResult() : nothing}
+          ${this.batchView === 'history' ? this.renderBatchHistory() : nothing}
+        </cds-modal-body>
+        <cds-modal-footer>
+          ${this.batchView === 'issues' ? html`
+            <cds-modal-footer-button kind="danger--tertiary" @click=${this.discardBatch}>放弃草稿</cds-modal-footer-button>
+            <cds-modal-footer-button kind="secondary" @click=${this.closeBatch}>稍后处理</cds-modal-footer-button>
+            <cds-modal-footer-button kind="primary" @click=${this.goPreview}
+              ?disabled=${!this.batchDraft?.issues.some((issue) => issue.selected)}>预览批次</cds-modal-footer-button>
+          ` : nothing}
+          ${this.batchView === 'preview' ? html`
+            <cds-modal-footer-button kind="secondary" @click=${this.backToIssues}>返回修改</cds-modal-footer-button>
+            <cds-modal-footer-button kind="primary" @click=${this.submitBatchNow}>确认并一次提交</cds-modal-footer-button>
+          ` : nothing}
+          ${this.batchView === 'result' ? html`
+            <cds-modal-footer-button kind="secondary" @click=${() => { this.batchView = 'history'; }}>批次回看</cds-modal-footer-button>
+            <cds-modal-footer-button kind="danger--tertiary" @click=${this.undoLastBatch}>整批撤销</cds-modal-footer-button>
+            <cds-modal-footer-button kind="primary" @click=${this.closeBatch}>完成值守</cds-modal-footer-button>
+          ` : nothing}
+          ${this.batchView === 'history' ? html`
+            <cds-modal-footer-button kind="primary" @click=${this.closeBatch}>关闭</cds-modal-footer-button>
+          ` : nothing}
+        </cds-modal-footer>
+      </cds-modal>
     `;
   }
 
@@ -831,7 +1303,15 @@ export class CaptionDesk extends LitElement {
                 <h2>校对编辑台</h2>
                 <p>标点、专有名词、发言人和数字均可在确认前修改</p>
               </div>
-              <cds-tag type="green" size="sm">本地草稿</cds-tag>
+              <div class="head-actions">
+                <cds-tag type="green" size="sm">本地草稿</cds-tag>
+                <cds-button kind="secondary" size="sm" @click=${this.openHistory}>批次回看</cds-button>
+                <cds-button class="batch-entry" kind="primary" size="sm" @click=${this.openBatch}>
+                  质检批次
+                  <span class=${`batch-entry-count ${this.currentBatchIssueCount ? '' : 'zero'}`}>${this.currentBatchIssueCount}</span>
+                </cds-button>
+                ${this.batchDraft ? html`<span class="batch-draft-dot">● 有未完成批次</span>` : nothing}
+              </div>
             </div>
             <div class="column-body" style=${`font-size:${this.model.fontSize}px`}>${this.renderEditor()}</div>
           </section>
@@ -860,6 +1340,8 @@ export class CaptionDesk extends LitElement {
             ></cds-toast-notification>
           `)}
         </div>
+
+        ${this.renderBatchModal()}
       </div>
     `;
   }
