@@ -1,9 +1,12 @@
 import { LitElement, css, html, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import {
+  applyQcBatch,
   applyRules,
   cloneModel,
+  computeQcOutcome,
   createInitialModel,
+  createQcBatch,
   mergeConfirmedSegments,
   normalizeNumbers,
   queueStats,
@@ -13,11 +16,23 @@ import {
   type CaptionSegment,
   type ConnectionState,
   type DeskModel,
+  type QcIssue,
+  type QcIssueKind,
   type SegmentState,
   type ToastMessage,
 } from './model';
 
 const HISTORY_LIMIT = 80;
+
+const QC_KIND_ORDER: QcIssueKind[] = ['punctuation', 'number', 'term', 'stale', 'duplicate'];
+
+const QC_KIND_META: Record<QcIssueKind, { label: string; hint: string }> = {
+  punctuation: { label: '标点', hint: '全半角与多余空格，可安全自动改写' },
+  number: { label: '数字', hint: '全角数字与中文数字规范化，可安全自动改写' },
+  term: { label: '术语', hint: '单条规则命中可自动改写，多条命中保留原文' },
+  stale: { label: '超时', hint: '默认跳过，不自动改写；勾选表示值班员已知晓' },
+  duplicate: { label: '重复', hint: '默认跳过，不自动改写；勾选表示值班员已知晓' },
+};
 
 function formatClock(seconds: number): string {
   const minutes = Math.floor(seconds / 60);
@@ -150,6 +165,7 @@ export class CaptionDesk extends LitElement {
     }
     .column-head h2 { margin: 0; font-size: 14px; font-weight: 600; }
     .column-head p { margin: 4px 0 0; color: var(--cds-text-secondary, #525252); font-size: 10px; }
+    .column-head > cds-button { margin-left: auto; flex: 0 0 auto; }
     .column-body { min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-color: #8d8d8d transparent; }
 
     .segment-list { padding: 8px; display: flex; flex-direction: column; gap: 1px; }
@@ -174,6 +190,46 @@ export class CaptionDesk extends LitElement {
     .segment-foot b { color: #0f62fe; font-weight: 500; }
     .issue-note { margin-top: 8px; padding: 7px 8px; background: #fff8e1; border-left: 2px solid #f1c21b; color: #684e00; font-size: 10px; line-height: 1.45; }
     .duplicate-note { background: #f6f2ff; border-color: #a56eff; color: #491d8b; }
+
+    .qc-panel { margin: 8px 8px 0; background: var(--cds-layer, #fff); border: 1px solid var(--cds-border-subtle, #e0e0e0); border-top: 3px solid #0f62fe; }
+    .qc-panel.committed { border-top-color: #42be65; }
+    .qc-head { padding: 10px 12px; display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); }
+    .qc-head strong { display: block; font-size: 12px; }
+    .qc-head span { display: block; margin-top: 3px; color: var(--cds-text-secondary, #525252); font-size: 10px; line-height: 1.4; }
+    .qc-head-actions { display: flex; gap: 4px; flex: 0 0 auto; }
+    .qc-groups { max-height: 320px; overflow: auto; overscroll-behavior: contain; }
+    .qc-group { border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); }
+    .qc-group-head { padding: 8px 12px 7px; display: flex; align-items: center; gap: 9px; background: var(--cds-layer-02, #f4f4f4); position: sticky; top: 0; z-index: 1; }
+    .qc-group-head .qc-group-title { font-size: 11px; font-weight: 600; }
+    .qc-group-head .qc-group-count { color: #0f62fe; font: 500 10px/1 "IBM Plex Mono", monospace; }
+    .qc-group-head .qc-group-hint { margin-left: auto; color: var(--cds-text-secondary, #525252); font-size: 9px; text-align: right; }
+    .qc-issue { padding: 8px 12px 8px 8px; display: flex; align-items: flex-start; gap: 8px; border-top: 1px solid var(--cds-border-subtle, #e0e0e0); }
+    .qc-issue.conflict { background: #fff1f1; }
+    .qc-issue cds-checkbox { flex: 0 0 auto; margin-top: 1px; }
+    .qc-ref { flex: 0 0 auto; border: 0; background: none; padding: 2px 0; color: #0f62fe; font: 500 10px/1.4 "IBM Plex Mono", monospace; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+    .qc-issue-body { min-width: 0; flex: 1; }
+    .qc-before { font-size: calc(var(--caption-font-size) * .78); line-height: 1.45; word-break: break-all; }
+    .qc-after { margin-top: 3px; padding-left: 7px; border-left: 2px solid #42be65; color: #198038; font-size: calc(var(--caption-font-size) * .72); line-height: 1.4; word-break: break-all; }
+    .qc-detail { margin-top: 3px; color: var(--cds-text-secondary, #525252); font-size: 9px; line-height: 1.4; }
+    .qc-conflict-flag { flex: 0 0 auto; padding: 2px 5px; background: #da1e28; color: #fff; font-size: 9px; }
+    .qc-foot { padding: 10px 12px; display: flex; align-items: center; justify-content: space-between; gap: 10px; background: var(--cds-layer-02, #f4f4f4); }
+    .qc-foot > span { color: var(--cds-text-secondary, #525252); font-size: 9px; line-height: 1.4; }
+    .qc-report { padding: 4px 0 0; }
+    .qc-report-section { padding: 9px 12px; border-top: 1px solid var(--cds-border-subtle, #e0e0e0); }
+    .qc-report-section h4 { margin: 0 0 7px; font-size: 11px; display: flex; justify-content: space-between; }
+    .qc-report-section h4 span { color: var(--cds-text-secondary, #525252); font-weight: 400; font-size: 9px; }
+    .qc-report-item { font-size: 10px; line-height: 1.5; padding: 5px 0; border-top: 1px dashed var(--cds-border-subtle, #e0e0e0); }
+    .qc-report-item:first-of-type { border-top: 0; }
+    .qc-report-item .qc-before { font-size: 10px; }
+    .qc-report-item .qc-after { font-size: 10px; }
+    .qc-report-item small { display: block; margin-top: 2px; color: var(--cds-text-secondary, #525252); font-size: 9px; }
+    .qc-kinds { display: inline-flex; gap: 3px; margin-left: 6px; vertical-align: 1px; }
+    .qc-kinds i { font-style: normal; padding: 1px 4px; background: #edf5ff; color: #0043ce; font-size: 9px; }
+    .qc-preview-list { display: flex; flex-direction: column; gap: 10px; }
+    .qc-preview-list h4 { margin: 0; font-size: 12px; }
+    .qc-preview-list p { margin: 4px 0 0; font-size: 11px; line-height: 1.5; }
+    .qc-preview-list .qc-after { font-size: 11px; }
+    .qc-empty-note { padding: 14px 12px; color: var(--cds-text-secondary, #525252); font-size: 10px; }
 
     .empty { padding: 48px 24px; text-align: center; color: var(--cds-text-secondary, #525252); }
     .empty strong { display: block; color: var(--cds-text-primary, #161616); margin-bottom: 6px; }
@@ -246,6 +302,7 @@ export class CaptionDesk extends LitElement {
   @state() private ruleSpeaker = '';
   @state() private filter: 'active' | 'all' | 'attention' = 'active';
   @state() private showRuleForm = false;
+  @state() private qcPreviewOpen = false;
   private past: DeskModel[] = [];
   private future: DeskModel[] = [];
   private ticker?: number;
@@ -534,6 +591,82 @@ export class CaptionDesk extends LitElement {
     this.commit('删除术语规则', (current) => ({ ...current, rules: current.rules.filter((item) => item.id !== id) }));
   }
 
+  private startQcBatch(): void {
+    const batch = createQcBatch(this.model);
+    if (!batch.issues.length) {
+      this.pushToast('info', '本批未发现可归类的问题', '标点、数字、术语、超时和重复均未命中');
+      return;
+    }
+    this.qcPreviewOpen = false;
+    this.automatic({ ...this.model, qcBatch: batch });
+    this.pushToast('success', '质检批次已生成', `共 ${batch.issues.length} 项问题，已按标点 / 数字 / 术语 / 超时 / 重复分组`);
+  }
+
+  private rescanQcBatch(): void {
+    const batch = createQcBatch(this.model);
+    this.qcPreviewOpen = false;
+    if (!batch.issues.length) {
+      this.automatic({ ...this.model, qcBatch: null });
+      this.pushToast('info', '重新扫描后问题已清零', '批次已关闭');
+      return;
+    }
+    this.automatic({ ...this.model, qcBatch: batch });
+    this.pushToast('info', '已按当前内容重新扫描', `仍有 ${batch.issues.length} 项问题，勾选状态已重置为默认`);
+  }
+
+  private cancelQcBatch(): void {
+    this.qcPreviewOpen = false;
+    this.automatic({ ...this.model, qcBatch: null });
+    this.pushToast('info', '质检批次已取消', '未改动任何字幕内容');
+  }
+
+  private updateQcIssues(update: (issue: QcIssue) => QcIssue): void {
+    const batch = this.model.qcBatch;
+    if (!batch || batch.status !== 'open') return;
+    this.automatic({ ...this.model, qcBatch: { ...batch, issues: batch.issues.map(update) } });
+  }
+
+  private toggleQcIssue(issueId: string, selected: boolean): void {
+    this.updateQcIssues((issue) => issue.id === issueId ? { ...issue, selected } : issue);
+  }
+
+  private toggleQcGroup(kind: QcIssueKind, selected: boolean): void {
+    this.updateQcIssues((issue) => issue.kind === kind && !issue.conflict ? { ...issue, selected } : issue);
+  }
+
+  private openQcPreview(): void {
+    const batch = this.model.qcBatch;
+    if (!batch || batch.status !== 'open') return;
+    if (!batch.issues.some((issue) => issue.selected || issue.conflict)) {
+      this.pushToast('warning', '没有可提交的内容', '请至少勾选一项，或直接取消批次');
+      return;
+    }
+    this.qcPreviewOpen = true;
+  }
+
+  private commitQcBatch(): void {
+    const outcome = computeQcOutcome(this.model);
+    this.qcPreviewOpen = false;
+    this.commit('', (current) => applyQcBatch(current));
+    const hitCount = outcome.ruleHits.reduce((total, hit) => total + hit.count, 0);
+    this.pushToast('success', '质检批次已提交', `改动 ${outcome.changes.length} 段 · 术语命中 ${hitCount} 次 · 冲突保留 ${outcome.conflicts.length} 段 · 跳过 ${outcome.skipped.length} 项`);
+  }
+
+  private undoQcBatch(): void {
+    if (!this.past.length) {
+      this.pushToast('info', '没有可撤销的批次', '历史记录为空');
+      return;
+    }
+    this.undo();
+    this.pushToast('info', '已撤销质检批次', '整批内容已恢复到批次开始前');
+  }
+
+  private finishQcBatch(): void {
+    this.qcPreviewOpen = false;
+    this.automatic({ ...this.model, qcBatch: null });
+    this.pushToast('info', '批次报告已清空', '改动保留在字幕草稿中，可用撤销继续回退');
+  }
+
   private exportSrt(): void {
     const content = toSrt(this.model);
     if (!content) {
@@ -593,6 +726,183 @@ export class CaptionDesk extends LitElement {
       this.insertPunctuation(punctuation[event.key]);
     }
   };
+
+  private renderQcIssue(issue: QcIssue) {
+    return html`
+      <div class="qc-issue ${issue.conflict ? 'conflict' : ''}">
+        ${issue.conflict ? html`<span class="qc-conflict-flag">冲突</span>` : html`
+          <cds-checkbox
+            hide-label
+            label-text=${`${QC_KIND_META[issue.kind].label}问题 第 ${issue.sequence} 段`}
+            ?checked=${issue.selected}
+            @cds-checkbox-changed=${(event: CustomEvent<{ checked: boolean }>) => this.toggleQcIssue(issue.id, event.detail.checked)}
+          ></cds-checkbox>
+        `}
+        <button class="qc-ref" title="在待确认区定位该片段" @click=${() => this.selectSegment(issue.segmentId)}>#${String(issue.sequence).padStart(3, '0')}</button>
+        <div class="qc-issue-body">
+          <div class="qc-before">${issue.before}</div>
+          ${issue.auto && issue.after !== issue.before ? html`<div class="qc-after">→ ${issue.after}</div>` : nothing}
+          <div class="qc-detail">${issue.speaker} · ${issue.detail}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  private renderQcGroup(kind: QcIssueKind, issues: QcIssue[]) {
+    const meta = QC_KIND_META[kind];
+    const selectable = issues.filter((issue) => !issue.conflict);
+    const checkedCount = selectable.filter((issue) => issue.selected).length;
+    const allChecked = selectable.length > 0 && checkedCount === selectable.length;
+    const indeterminate = checkedCount > 0 && !allChecked;
+    return html`
+      <div class="qc-group">
+        <div class="qc-group-head">
+          <cds-checkbox
+            hide-label
+            label-text=${`整组勾选${meta.label}问题`}
+            ?checked=${allChecked}
+            ?indeterminate=${indeterminate}
+            @cds-checkbox-changed=${(event: CustomEvent<{ checked: boolean }>) => this.toggleQcGroup(kind, event.detail.checked)}
+          ></cds-checkbox>
+          <span class="qc-group-title">${meta.label}</span>
+          <span class="qc-group-count">${checkedCount}/${issues.length}</span>
+          <span class="qc-group-hint">${meta.hint}</span>
+        </div>
+        ${issues.map((issue) => this.renderQcIssue(issue))}
+      </div>
+    `;
+  }
+
+  private renderQcReportList(title: string, entries: { segmentId: string; sequence: number; reason: string }[], empty: string) {
+    return html`
+      <div class="qc-report-section">
+        <h4>${title}<span>${entries.length ? `${entries.length} 项` : empty}</span></h4>
+        ${entries.map((entry) => html`
+          <div class="qc-report-item">
+            <button class="qc-ref" @click=${() => this.selectSegment(entry.segmentId)}>#${String(entry.sequence).padStart(3, '0')}</button>
+            <small>${entry.reason}</small>
+          </div>
+        `)}
+      </div>
+    `;
+  }
+
+  private renderQcReport(batch: NonNullable<DeskModel['qcBatch']>) {
+    const report = batch.report;
+    if (!report) return nothing;
+    const hitCount = report.ruleHits.reduce((total, hit) => total + hit.count, 0);
+    return html`
+      <section class="qc-panel committed">
+        <div class="qc-head">
+          <div>
+            <strong>批次报告 · 已提交</strong>
+            <span>提交于 ${new Date(report.appliedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · 改动 ${report.changes.length} 段 · 术语命中 ${hitCount} 次 · 冲突 ${report.conflicts.length} 段 · 撤销可整批恢复</span>
+          </div>
+          <div class="qc-head-actions">
+            <cds-button kind="ghost" size="sm" @click=${this.undoQcBatch}>撤销本批</cds-button>
+            <cds-button kind="danger--ghost" size="sm" @click=${this.finishQcBatch}>完成并清空</cds-button>
+          </div>
+        </div>
+        <div class="qc-report">
+          <div class="qc-report-section">
+            <h4>改动明细<span>${report.changes.length ? `${report.changes.length} 段` : '本批无实际改动'}</span></h4>
+            ${report.changes.map((change) => html`
+              <div class="qc-report-item">
+                <button class="qc-ref" @click=${() => this.selectSegment(change.segmentId)}>#${String(change.sequence).padStart(3, '0')}</button>
+                <span class="qc-kinds">${change.kinds.map((kind) => html`<i>${QC_KIND_META[kind].label}</i>`)}</span>
+                <div class="qc-before">${change.before}</div>
+                <div class="qc-after">→ ${change.after}</div>
+              </div>
+            `)}
+          </div>
+          <div class="qc-report-section">
+            <h4>规则命中次数<span>${report.ruleHits.length ? '' : '本批未命中术语规则'}</span></h4>
+            ${report.ruleHits.map((hit) => html`
+              <div class="qc-report-item">${hit.source} → ${hit.replacement}<small>命中 ${hit.count} 次 · 累计使用 ${this.model.rules.find((rule) => rule.id === hit.ruleId)?.usageCount ?? hit.count} 次</small></div>
+            `)}
+          </div>
+          ${this.renderQcReportList('冲突保留原文', report.conflicts, '无冲突')}
+          ${this.renderQcReportList('已知晓（超时 / 重复）', report.acknowledged, '无')}
+          ${this.renderQcReportList('默认跳过', report.skipped, '无')}
+        </div>
+      </section>
+    `;
+  }
+
+  private renderQcPanel() {
+    const batch = this.model.qcBatch;
+    if (!batch) return nothing;
+    if (batch.status === 'committed') return this.renderQcReport(batch);
+    const groups = QC_KIND_ORDER
+      .map((kind) => ({ kind, issues: batch.issues.filter((issue) => issue.kind === kind) }))
+      .filter((group) => group.issues.length > 0);
+    const selectedCount = batch.issues.filter((issue) => issue.selected).length;
+    const canCommit = batch.issues.some((issue) => issue.selected || issue.conflict);
+    return html`
+      <section class="qc-panel">
+        <div class="qc-head">
+          <div>
+            <strong>质检批次 ${batch.id.slice(-4).toUpperCase()} · 待提交</strong>
+            <span>扫描于 ${new Date(batch.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · ${batch.issues.length} 项问题 · 已勾选 ${selectedCount} 项 · 重开页面可继续处理</span>
+          </div>
+          <div class="qc-head-actions">
+            <cds-button kind="ghost" size="sm" @click=${this.rescanQcBatch}>重新扫描</cds-button>
+            <cds-button kind="danger--ghost" size="sm" @click=${this.cancelQcBatch}>取消批次</cds-button>
+          </div>
+        </div>
+        <div class="qc-groups">
+          ${groups.map((group) => this.renderQcGroup(group.kind, group.issues))}
+        </div>
+        <div class="qc-foot">
+          <span>仅自动套用标点、数字与无冲突术语；超时和重复默认跳过，冲突段保留原文。</span>
+          <cds-button kind="primary" size="sm" ?disabled=${!canCommit} @click=${this.openQcPreview}>预览并提交</cds-button>
+        </div>
+      </section>
+    `;
+  }
+
+  private renderQcPreviewModal() {
+    const batch = this.model.qcBatch;
+    if (!batch || batch.status !== 'open') return nothing;
+    const outcome = computeQcOutcome(this.model);
+    const hitCount = outcome.ruleHits.reduce((total, hit) => total + hit.count, 0);
+    return html`
+      <cds-modal ?open=${this.qcPreviewOpen} @cds-modal-closed=${() => { this.qcPreviewOpen = false; }}>
+        <cds-modal-header>
+          <cds-modal-close-button></cds-modal-close-button>
+          <cds-modal-label>质检批次 ${batch.id.slice(-4).toUpperCase()}</cds-modal-label>
+          <cds-modal-heading>提交前预览</cds-modal-heading>
+        </cds-modal-header>
+        <cds-modal-body>
+          <div class="qc-preview-list">
+            <section>
+              <h4>即将改动 ${outcome.changes.length} 段</h4>
+              ${outcome.changes.length ? outcome.changes.map((change) => html`
+                <p>#${String(change.sequence).padStart(3, '0')} ${change.kinds.map((kind) => QC_KIND_META[kind].label).join(' / ')}<br />${change.before}</p>
+                <p class="qc-after">→ ${change.after}</p>
+              `) : html`<p>本次没有会自动改写的片段。</p>`}
+            </section>
+            <section>
+              <h4>术语规则命中 ${hitCount} 次</h4>
+              ${outcome.ruleHits.length ? outcome.ruleHits.map((hit) => html`<p>${hit.source} → ${hit.replacement} × ${hit.count}</p>`) : html`<p>无规则命中。</p>`}
+            </section>
+            <section>
+              <h4>冲突保留原文 ${outcome.conflicts.length} 段</h4>
+              ${outcome.conflicts.length ? outcome.conflicts.map((conflict) => html`<p>#${String(conflict.sequence).padStart(3, '0')} ${conflict.reason}</p>`) : html`<p>无冲突。</p>`}
+            </section>
+            <section>
+              <h4>跳过 ${outcome.skipped.length} 项 · 已知晓 ${outcome.acknowledged.length} 项</h4>
+              ${outcome.skipped.length ? outcome.skipped.map((skip) => html`<p>#${String(skip.sequence).padStart(3, '0')} ${skip.reason}</p>`) : html`<p>无跳过项。</p>`}
+            </section>
+          </div>
+        </cds-modal-body>
+        <cds-modal-footer>
+          <cds-modal-footer-button kind="secondary" data-modal-close>返回修改勾选</cds-modal-footer-button>
+          <cds-modal-footer-button kind="primary" @click=${this.commitQcBatch}>确认提交本批</cds-modal-footer-button>
+        </cds-modal-footer>
+      </cds-modal>
+    `;
+  }
 
   private renderPendingList() {
     const segments = this.pendingSegments;
@@ -816,13 +1126,14 @@ export class CaptionDesk extends LitElement {
                 <h2>待确认区</h2>
                 <p>按收到顺序排列，重复和过期内容不会被静默覆盖</p>
               </div>
+              <cds-button kind="tertiary" size="sm" @click=${this.startQcBatch}>质检批次${this.model.qcBatch ? html`（${this.model.qcBatch.issues.length}）` : nothing}</cds-button>
               <cds-dropdown value=${this.filter} @cds-dropdown-selected=${(event: CustomEvent<{ item: { value: string } }>) => { this.filter = event.detail.item.value as typeof this.filter; }}>
                 <cds-dropdown-item value="active">仅需处理</cds-dropdown-item>
                 <cds-dropdown-item value="attention">异常优先</cds-dropdown-item>
                 <cds-dropdown-item value="all">全部片段</cds-dropdown-item>
               </cds-dropdown>
             </div>
-            <div class="column-body">${this.renderPendingList()}</div>
+            <div class="column-body">${this.renderQcPanel()}${this.renderPendingList()}</div>
           </section>
 
           <section class="column">
@@ -860,6 +1171,8 @@ export class CaptionDesk extends LitElement {
             ></cds-toast-notification>
           `)}
         </div>
+
+        ${this.renderQcPreviewModal()}
       </div>
     `;
   }
